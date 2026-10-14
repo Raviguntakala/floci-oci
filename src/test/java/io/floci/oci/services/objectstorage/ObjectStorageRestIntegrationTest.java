@@ -10,6 +10,7 @@ import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class ObjectStorageRestIntegrationTest {
@@ -431,8 +432,13 @@ class ObjectStorageRestIntegrationTest {
                 + "algorithm=\"rsa-sha256\",headers=\"date (request-target) host\","
                 + "signature=\"ZmFrZXNpZ25hdHVyZQ==\"";
 
+        String namespace = given().header("Authorization", auth)
+            .when().get("/n")
+            .then().statusCode(200)
+                .extract().as(String.class);
+
         given().header("Authorization", auth)
-            .when().get("/n/" + NS)
+            .when().get("/n/" + namespace)
             .then().statusCode(200)
                 .body("defaultS3CompartmentId", equalTo(tenancy))
                 .body("defaultSwiftCompartmentId", equalTo(tenancy));
@@ -440,7 +446,7 @@ class ObjectStorageRestIntegrationTest {
         given().header("Authorization", auth)
                 .contentType("application/json")
                 .body(Map.of("name", "it-signed-" + System.nanoTime(), "compartmentId", tenancy))
-            .when().post("/n/" + NS + "/b")
+            .when().post("/n/" + namespace + "/b")
             .then().statusCode(200)
                 .body("createdBy", equalTo(user));
     }
@@ -453,5 +459,115 @@ class ObjectStorageRestIntegrationTest {
             .when().post("/n/" + NS + "/b")
             .then().statusCode(200)
                 .body("createdBy", equalTo(config.defaultTenancyId()));
+    }
+
+    @Test
+    void eachTenancyGetsItsOwnNamespace() {
+        String other = "ocid1.tenancy.oc1..itnamespacetenancy";
+        String signed = given()
+                .header("Authorization", "Signature version=\"1\",keyId=\"" + other
+                        + "/ocid1.user.oc1..ituser/aa:bb\",algorithm=\"rsa-sha256\",signature=\"x\"")
+            .when().get("/n")
+            .then().statusCode(200)
+                .header("opc-request-id", notNullValue())
+                .extract().as(String.class);
+        assertTrue(signed.matches("[a-z0-9]{12}"), signed);
+
+        given().queryParam("compartmentId", other)
+            .when().get("/n")
+            .then().statusCode(200).body(equalTo("\"" + signed + "\""));
+
+        given()
+            .when().get("/n")
+            .then().statusCode(200).body(equalTo("\"" + NS + "\""));
+    }
+
+    @Test
+    void preauthenticatedRequestOfAnotherTenancyIsReachable() {
+        String signer = "Signature version=\"1\",keyId=\"ocid1.tenancy.oc1..itpartenancy"
+                + "/ocid1.user.oc1..ituser/aa:bb\",algorithm=\"rsa-sha256\",signature=\"x\"";
+        String ns = given().header("Authorization", signer)
+            .when().get("/n").then().statusCode(200).extract().as(String.class);
+        String bucket = uniqueBucket("it-par-tenancy");
+        given().header("Authorization", signer).contentType("application/json")
+                .body(Map.of("name", bucket, "compartmentId", COMPARTMENT))
+            .when().post("/n/" + ns + "/b")
+            .then().statusCode(200);
+        given().header("Authorization", signer).contentType("text/plain").body("tenancy-payload")
+            .when().put("/n/" + ns + "/b/" + bucket + "/o/shared.txt")
+            .then().statusCode(200);
+        String accessUri = given().header("Authorization", signer)
+                .contentType("application/json")
+                .body(Map.of("name", "share", "accessType", "ObjectRead",
+                        "timeExpires", "2999-01-01T00:00:00Z", "objectName", "shared.txt"))
+            .when().post("/n/" + ns + "/b/" + bucket + "/p")
+            .then().statusCode(200)
+                .body("accessUri", startsWith("/p/"))
+                .extract().path("accessUri");
+
+        given()
+            .when().get(accessUri)
+            .then().statusCode(200).body(equalTo("tenancy-payload"));
+
+        given()
+            .when().get(accessUri.replace("/n/" + ns + "/", "/n/" + NS + "/"))
+            .then().statusCode(404)
+                .header("opc-request-id", notNullValue())
+                .body("code", equalTo("NotAuthorizedOrNotFound"));
+    }
+
+    @Test
+    void copyObjectWritesIntoTheDestinationRegion() {
+        String phoenix = "objectstorage.us-phoenix-1.oraclecloud.com";
+        String source = uniqueBucket("it-copy-src");
+        String target = uniqueBucket("it-copy-dst");
+        createBucket(source);
+        given().header("Host", phoenix).contentType("application/json")
+                .body(Map.of("name", target, "compartmentId", COMPARTMENT))
+            .when().post("/n/" + NS + "/b")
+            .then().statusCode(200);
+        given().contentType("text/plain").body("cross-region")
+            .when().put("/n/" + NS + "/b/" + source + "/o/original.txt")
+            .then().statusCode(200);
+
+        String workRequestId = given().contentType("application/json")
+                .body(Map.of("sourceObjectName", "original.txt", "destinationRegion", "us-phoenix-1",
+                        "destinationNamespace", NS, "destinationBucket", target,
+                        "destinationObjectName", "copied.txt"))
+            .when().post("/n/" + NS + "/b/" + source + "/actions/copyObject")
+            .then().statusCode(202)
+                .extract().header("opc-work-request-id");
+
+        given()
+            .when().get("/workRequests/" + workRequestId)
+            .then().statusCode(200).body("status", equalTo("COMPLETED"));
+        given().header("Host", phoenix)
+            .when().get("/n/" + NS + "/b/" + target + "/o/copied.txt")
+            .then().statusCode(200).body(equalTo("cross-region"));
+        given()
+            .when().get("/n/" + NS + "/b/" + source + "/o/copied.txt")
+            .then().statusCode(404);
+    }
+
+    @Test
+    void copyObjectRequiresAKnownDestinationRegion() {
+        String bucket = uniqueBucket("it-copy-region");
+        createBucket(bucket);
+        given().contentType("text/plain").body("x")
+            .when().put("/n/" + NS + "/b/" + bucket + "/o/o.txt")
+            .then().statusCode(200);
+
+        given().contentType("application/json")
+                .body(Map.of("sourceObjectName", "o.txt", "destinationNamespace", NS,
+                        "destinationBucket", bucket, "destinationObjectName", "c.txt"))
+            .when().post("/n/" + NS + "/b/" + bucket + "/actions/copyObject")
+            .then().statusCode(400).body("code", equalTo("MissingParameter"));
+
+        given().contentType("application/json")
+                .body(Map.of("sourceObjectName", "o.txt", "destinationRegion", "xx-nowhere-1",
+                        "destinationNamespace", NS, "destinationBucket", bucket,
+                        "destinationObjectName", "c.txt"))
+            .when().post("/n/" + NS + "/b/" + bucket + "/actions/copyObject")
+            .then().statusCode(400).body("code", equalTo("InvalidParameter"));
     }
 }

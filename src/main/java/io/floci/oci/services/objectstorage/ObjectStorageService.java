@@ -10,6 +10,8 @@ import io.floci.oci.core.common.ServiceDescriptor;
 import io.floci.oci.core.common.ServiceRegistry;
 import io.floci.oci.core.storage.StorageBackend;
 import io.floci.oci.core.storage.StorageFactory;
+import io.floci.oci.core.storage.TenancyAwareStorageBackend;
+import io.floci.oci.core.tenancy.TenancyNames;
 import io.floci.oci.core.workrequest.WorkRequestService;
 import io.floci.oci.services.objectstorage.model.StoredBucket;
 import io.floci.oci.services.objectstorage.model.StoredMultipartUpload;
@@ -28,16 +30,24 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
 
 @ApplicationScoped
 public class ObjectStorageService {
 
     private static final Logger LOG = Logger.getLogger(ObjectStorageService.class);
+
+    private static final String NAMESPACE_ALPHABET = "abcdefghijklmnopqrstuvwxyz0123456789";
+    private static final int NAMESPACE_LENGTH = 12;
 
     private final StorageBackend<String, StoredBucket> buckets;
     private final StorageBackend<String, StoredOsObject> objects;
@@ -47,6 +57,11 @@ public class ObjectStorageService {
     private final OciContext ociContext;
     private final ServiceRegistry serviceRegistry;
     private final WorkRequestService workRequests;
+    /**
+     * The tenancy each pre-authenticated request token was last found in, so a token in use is not
+     * looked up across every partition each time. Checked against the store on every use.
+     */
+    private final Map<String, String> parOwners = new ConcurrentHashMap<>();
 
     @Inject
     public ObjectStorageService(StorageFactory storageFactory, EmulatorConfig config,
@@ -64,6 +79,7 @@ public class ObjectStorageService {
                 new TypeReference<Map<String, StoredMultipartUpload>>() {});
         this.pars = storageFactory.create("objectstorage", "objectstorage-pars.json",
                 new TypeReference<Map<String, StoredPar>>() {});
+        storageFactory.afterLoad(this::migrateSavedNamespaces);
     }
 
     ObjectStorageService(StorageBackend<String, StoredBucket> buckets,
@@ -82,6 +98,52 @@ public class ObjectStorageService {
         this.workRequests = workRequests;
     }
 
+    /**
+     * Rewrites the namespace saved on buckets and multipart uploads to their tenancy's own. Data
+     * written before each tenancy had its own namespace carries the configured default, which
+     * clients would send back and get 404 NamespaceNotFound for. Pre-authenticated requests keep
+     * theirs: it is part of the access URI already handed out.
+     *
+     * @return the number of entries rewritten
+     */
+    int migrateSavedNamespaces() {
+        int rewritten = migrateSavedNamespaces(buckets, StoredBucket::getNamespace, StoredBucket::setNamespace)
+                + migrateSavedNamespaces(uploads, StoredMultipartUpload::getNamespace,
+                        StoredMultipartUpload::setNamespace);
+        if (rewritten > 0) {
+            LOG.infov("Moved {0} Object Storage buckets and uploads to their tenancy's namespace", rewritten);
+        }
+        return rewritten;
+    }
+
+    private <V> int migrateSavedNamespaces(StorageBackend<String, V> store, Function<V, String> namespaceOfEntry,
+                                           BiConsumer<V, String> setNamespace) {
+        if (!(store instanceof TenancyAwareStorageBackend<V> tenancyAware)) {
+            return 0;
+        }
+        int rewritten = 0;
+        for (String partition : tenancyAware.tenancies()) {
+            String namespace = namespaceOf(TenancyAwareStorageBackend.tenancyOf(partition));
+            Map<String, V> updates = new LinkedHashMap<>();
+            for (String key : tenancyAware.keysForTenancy(partition)) {
+                tenancyAware.getForTenancy(partition, key)
+                        .filter(entry -> !namespace.equals(namespaceOfEntry.apply(entry)))
+                        .ifPresent(entry -> {
+                            setNamespace.accept(entry, namespace);
+                            updates.put(key, entry);
+                        });
+            }
+            if (!updates.isEmpty()) {
+                tenancyAware.putAllForTenancy(partition, updates);
+                rewritten += updates.size();
+            }
+        }
+        if (rewritten > 0) {
+            tenancyAware.flush();
+        }
+        return rewritten;
+    }
+
     void onStart(@Observes StartupEvent ev) {
         serviceRegistry.register(ServiceDescriptor.builder("objectstorage")
                 .enabled(config.services().objectstorage().enabled())
@@ -92,13 +154,44 @@ public class ObjectStorageService {
 
     // ── Namespace ──────────────────────────────────────────────────────────────
 
+    /** The namespace of the calling tenancy: one per tenancy, the same in every region. */
     public String namespace() {
-        return config.defaultNamespace();
+        return namespaceOf(ociContext.tenancyId());
     }
 
-    /** Any namespace value is accepted on read; only the configured one exists. */
+    /**
+     * Each tenancy has one unique, uneditable namespace. The default tenancy keeps
+     * {@code default-namespace}; any other gets a stable 12 character lowercase string derived
+     * from its OCID, the shape real namespaces have (e.g. {@code axzbp3kgiaim}).
+     */
+    public String namespaceOf(String tenancyId) {
+        if (tenancyId == null || tenancyId.equals(config.defaultTenancyId())) {
+            return config.defaultNamespace();
+        }
+        return TenancyNames.derive(tenancyId, NAMESPACE_ALPHABET, NAMESPACE_LENGTH);
+    }
+
+    /**
+     * GetNamespace with its optional {@code compartmentId}: a tenancy OCID names that tenancy's
+     * namespace. A compartment OCID resolves to the caller's namespace, because the emulator
+     * does not look compartments up across tenancies.
+     */
+    public String namespaceFor(String compartmentId) {
+        if (compartmentId == null || compartmentId.isBlank()) {
+            return namespace();
+        }
+        if (!Ocids.isValid(compartmentId)) {
+            throw OciException.invalidParameter("compartmentId is not a valid OCID: " + compartmentId);
+        }
+        return Ocids.isOfType(compartmentId, "tenancy") ? namespaceOf(compartmentId) : namespace();
+    }
+
+    /** A namespace in the path that is not the caller's is 404 NamespaceNotFound, as on real OCI. */
     public void requireNamespace(String namespaceName) {
-        // Real OCI would 404 foreign namespaces; the emulator accepts any to ease fixtures.
+        if (!namespace().equals(namespaceName)) {
+            throw OciException.namespaceNotFound("Either the namespace " + namespaceName
+                    + " does not exist or you are not authorized to access it.");
+        }
     }
 
     public Map<String, Object> namespaceMetadata(String namespaceName) {
@@ -336,13 +429,23 @@ public class ObjectStorageService {
         return source;
     }
 
-    /** Copy is async on real OCI: returns the work-request OCID for the 202 response. */
+    /**
+     * Copy is async on real OCI: returns the work-request OCID for the 202 response.
+     * CopyObject runs against the source region's endpoint and copies "within a region or to
+     * another region": the destination bucket is looked up, and the copy written, in
+     * {@code destRegion}. The work request stays in the source region, where clients poll it.
+     */
     public String copyObject(String namespaceName, String bucketName, String sourceObjectName,
-                             String destNamespace, String destBucket, String destObjectName,
-                             String sourceIfMatch) {
+                             String destRegion, String destNamespace, String destBucket,
+                             String destObjectName, String sourceIfMatch) {
         StoredOsObject source = getObject(namespaceName, bucketName, sourceObjectName);
         Etags.checkIfMatch(sourceIfMatch, source.getEtag());
-        getBucket(destNamespace, destBucket);
+        String destPartition = TenancyAwareStorageBackend.regionalPartition(ociContext.tenancyId(), destRegion);
+        if (TenancyAwareStorageBackend.getIn(buckets, destPartition, destBucket).isEmpty()) {
+            throw OciException.bucketNotFound("Either the bucket named '" + destBucket
+                    + "' does not exist in the namespace '" + destNamespace + "' in region " + destRegion
+                    + " or you are not authorized to access it");
+        }
 
         StoredOsObject copy = new StoredOsObject();
         copy.setName(destObjectName);
@@ -355,7 +458,7 @@ public class ObjectStorageService {
         copy.setTimeCreated(now);
         copy.setTimeModified(now);
         copy.setMetadata(source.getMetadata());
-        objects.put(objectKey(destBucket, destObjectName), copy);
+        TenancyAwareStorageBackend.putIn(objects, destPartition, objectKey(destBucket, destObjectName), copy);
 
         StoredBucket bucket = getBucket(namespaceName, bucketName);
         // Object Storage work requests terminate in COMPLETED (Identity uses SUCCEEDED).
@@ -503,16 +606,41 @@ public class ObjectStorageService {
         pars.delete(par.getToken());
     }
 
-    /** Resolves a PAR token for the anonymous /p/{token}/… data path. */
-    public StoredPar resolveParToken(String token) {
-        StoredPar par = pars.get(token)
+    /** A pre-authenticated request and the tenancy that created it, which the token acts as. */
+    public record ParAccess(StoredPar par, String tenancyId) {
+    }
+
+    /**
+     * Resolves a PAR token for the anonymous {@code /p/{token}/n/{namespace}/…} data path. The
+     * request carries no signature, so the token is looked up in every tenancy's partition for
+     * the request region, and must have been created under the namespace in the path.
+     */
+    public ParAccess resolveParToken(String token, String namespaceName) {
+        ParAccess access = findPar(token)
+                .filter(found -> found.par().getNamespace().equals(namespaceName))
                 .orElseThrow(() -> OciException.notAuthorizedOrNotFound(
                         "The pre-authenticated request does not exist or is expired."));
-        if (Instant.parse(par.getTimeExpires()).isBefore(Instant.now())) {
+        if (Instant.parse(access.par().getTimeExpires()).isBefore(Instant.now())) {
             throw OciException.notAuthorizedOrNotFound(
                     "The pre-authenticated request does not exist or is expired.");
         }
-        return par;
+        return access;
+    }
+
+    private Optional<ParAccess> findPar(String token) {
+        String region = ociContext.region();
+        String owner = parOwners.get(token);
+        if (owner != null) {
+            Optional<StoredPar> par = TenancyAwareStorageBackend.getIn(pars,
+                    TenancyAwareStorageBackend.regionalPartition(owner, region), token);
+            if (par.isPresent()) {
+                return Optional.of(new ParAccess(par.get(), owner));
+            }
+        }
+        Optional<ParAccess> found = TenancyAwareStorageBackend.findInRegion(pars, region, token, ociContext.tenancyId())
+                .map(owned -> new ParAccess(owned.value(), owned.tenancyId()));
+        found.ifPresentOrElse(access -> parOwners.put(token, access.tenancyId()), () -> parOwners.remove(token));
+        return found;
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────
