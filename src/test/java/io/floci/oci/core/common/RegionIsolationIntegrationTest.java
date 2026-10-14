@@ -53,7 +53,6 @@ class RegionIsolationIntegrationTest {
     @Test
     void identityIsGlobalAcrossRegions() {
         String compartmentId = given()
-                .header("Host", PHOENIX_IDENTITY)
                 .contentType("application/json")
                 .body(Map.of("compartmentId", TENANCY, "name", "region-c-" + System.nanoTime(),
                         "description", "global"))
@@ -61,16 +60,16 @@ class RegionIsolationIntegrationTest {
             .then().statusCode(200)
                 .extract().path("id");
 
-        given()
+        given().header("Host", PHOENIX_IDENTITY)
             .when().get("/20160918/compartments/" + compartmentId)
             .then().statusCode(200).body("id", equalTo(compartmentId));
 
-        String workRequestId = given().header("Host", PHOENIX_IDENTITY)
+        String workRequestId = given()
             .when().delete("/20160918/compartments/" + compartmentId)
             .then().statusCode(202)
                 .extract().header("opc-work-request-id");
 
-        given()
+        given().header("Host", PHOENIX_IDENTITY)
             .when().get("/20160918/workRequests/" + workRequestId)
             .then().statusCode(200).body("status", equalTo("SUCCEEDED"));
     }
