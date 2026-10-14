@@ -391,10 +391,31 @@ class OkeClusterManagerTest {
         when(lifecycleManager.containerEnv(anyString())).thenReturn(List.of(
                 OkeClusterManager.API_TOKEN_ENV + "=" + cluster.getApiToken(),
                 OkeClusterManager.WEBHOOK_KUBECONFIG_ENV + "=" + webhookKubeconfig));
+        when(lifecycleManager.containerLabels(anyString())).thenReturn(
+                Map.of(ContainerStorageHelper.REGION_LABEL, "us-ashburn-1"));
 
         manager.startCluster(cluster);
 
         verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void startClusterRecreatesARunningSidecarLabelledWithAnotherRegion() {
+        StoredOkeCluster cluster = adoptableCluster("ocid1.cluster.oc1.phx.adopt003");
+        cluster.setRegion("us-phoenix-1");
+        String webhookKubeconfig = manager.webhookKubeconfig(cluster);
+        when(lifecycleManager.isContainerRunning(anyString())).thenReturn(true);
+        when(lifecycleManager.containerEnv(anyString())).thenReturn(List.of(
+                OkeClusterManager.API_TOKEN_ENV + "=" + cluster.getApiToken(),
+                OkeClusterManager.WEBHOOK_KUBECONFIG_ENV + "=" + webhookKubeconfig));
+        when(lifecycleManager.containerLabels(anyString())).thenReturn(
+                Map.of(ContainerStorageHelper.REGION_LABEL, "us-ashburn-1"));
+        when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-new", Map.of()));
+
+        manager.startCluster(cluster);
+
+        verify(lifecycleManager).removeIfExists(anyString());
+        verify(lifecycleManager).createAndStart(any());
     }
 
     @Test
@@ -465,5 +486,26 @@ class OkeClusterManagerTest {
                         "io.floci.compartment", "ocid1.compartment.oc1..labelled",
                         "io.floci.region", "us-ashburn-1"),
                 spec.getValue().labels());
+    }
+
+    @Test
+    void startClusterLabelsContainerWithTheClusterRegion() {
+        OkeClusterManager labelledManager = new OkeClusterManager(
+                new ContainerBuilder(config, mock(DockerHostResolver.class), null), lifecycleManager, portAllocator,
+                dockerHostResolver, containerDetector, networkResolver, config);
+        when(portAllocator.allocate(6443, 6543)).thenReturn(6443);
+        when(lifecycleManager.createAndStart(any())).thenReturn(new ContainerLifecycleManager.ContainerInfo("c-1", Map.of()));
+        StoredOkeCluster cluster = new StoredOkeCluster();
+        cluster.setId("ocid1.cluster.oc1.phx.labelled002");
+        cluster.setCompartmentId("ocid1.compartment.oc1..labelled");
+        cluster.setName("phoenix-cluster");
+        cluster.setApiToken("token-labelled002");
+        cluster.setRegion("us-phoenix-1");
+
+        labelledManager.startCluster(cluster);
+
+        ArgumentCaptor<ContainerSpec> spec = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager).createAndStart(spec.capture());
+        assertEquals("us-phoenix-1", spec.getValue().labels().get("io.floci.region"));
     }
 }
