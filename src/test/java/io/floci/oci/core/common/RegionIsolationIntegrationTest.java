@@ -1,6 +1,8 @@
 package io.floci.oci.core.common;
 
+import io.floci.oci.testing.TestRegions;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -17,6 +19,11 @@ class RegionIsolationIntegrationTest {
             "ocid1.tenancy.oc1..flocitesttenancy00000000000000000000000000000000000000000";
     private static final String PHOENIX_QUEUE = "queue.us-phoenix-1.oci.oraclecloud.com";
     private static final String PHOENIX_IDENTITY = "identity.us-phoenix-1.oci.oraclecloud.com";
+
+    @BeforeEach
+    void subscribePhoenix() {
+        TestRegions.subscribe(TENANCY, "PHX");
+    }
 
     @Test
     void queueCreatedInPhoenixIsInvisibleFromTheDefaultRegion() {
@@ -79,7 +86,7 @@ class RegionIsolationIntegrationTest {
         given().header("Host", PHOENIX_IDENTITY).queryParam("compartmentId", TENANCY)
             .when().get("/20160918/availabilityDomains")
             .then().statusCode(200)
-                .body("[0].name", equalTo("Floc:US-PHOENIX-1-AD-1"));
+                .body("[0].name", equalTo("Floc:PHX-AD-1"));
 
         given().header("Host", PHOENIX_IDENTITY)
             .when().get("/20160918/tenancies/" + TENANCY + "/regionSubscriptions")
