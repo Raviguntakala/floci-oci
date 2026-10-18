@@ -174,6 +174,7 @@ public class IdentityService {
                 .enabled(config.services().identity().enabled())
                 .storageKey("identity")
                 .resourceClasses(IdentityController.class)
+                .global(true)
                 .build());
         adoptLegacyRootRecords();
     }
