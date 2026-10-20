@@ -18,10 +18,14 @@ import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -70,5 +74,30 @@ class FnServerManagerTest {
         assertEquals(
                 Map.of("io.floci", "oci", "io.floci.service", "functions"),
                 spec.getValue().labels());
+    }
+
+    @Test
+    void aFailedStartReleasesItsPort() {
+        when(portAllocator.allocate(8080, 8099)).thenReturn(8081);
+        when(lifecycleManager.createAndStart(any()))
+                .thenThrow(new RuntimeException("Bind for 0.0.0.0:8081 failed: port is already allocated"));
+
+        assertThrows(RuntimeException.class, () -> manager.ensureStarted());
+
+        verify(portAllocator).release(8081);
+        assertFalse(manager.isStarted());
+    }
+
+    @Test
+    void aFailedVolumeSetupReleasesItsPort() {
+        when(portAllocator.allocate(8080, 8099)).thenReturn(8081);
+        doThrow(new RuntimeException("docker daemon unreachable"))
+                .when(lifecycleManager).ensureVolume(any());
+
+        assertThrows(RuntimeException.class, () -> manager.ensureStarted());
+
+        verify(portAllocator).release(8081);
+        verify(lifecycleManager, never()).createAndStart(any());
+        assertFalse(manager.isStarted());
     }
 }
